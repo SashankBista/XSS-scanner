@@ -11,7 +11,7 @@ import argparse
 import threading
 import pickle
 import os
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse, quote
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
@@ -797,11 +797,16 @@ class AdvancedXSSScanner:
 
         return groups or [('query', parsed, '', {})]
 
-    def _build_fuzzed_url(self, mode: str, parsed, route_path: str, new_params: dict) -> str:
-        new_query = urlencode(new_params)
-        if mode == 'hash':
-            return urlunparse(parsed._replace(fragment=f"{route_path}?{new_query}"))
-        return urlunparse(parsed._replace(query=new_query))
+    def _build_fuzzed_url(self, mode, parsed, route_path, new_params):
+        if mode == "hash":
+            query = "&".join(
+                f"{k}={quote(v[0] if isinstance(v, list) else v, safe='')}"
+                for k, v in new_params.items()
+            )
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{route_path}?{query}"
+        else:
+            flat = {k: (v[0] if isinstance(v, list) else v) for k, v in new_params.items()}
+            return urlunparse(parsed._replace(query=urlencode(flat)))
 
     def _record_payload_result(self, payload: str, mode: str, success: bool):
         with self.payload_results_lock:
@@ -1107,20 +1112,12 @@ class AdvancedXSSScanner:
                 self._dismiss_overlays(page)
                 self._reveal_hidden_search_boxes(page)
 
-                try:
-                    page.evaluate("""
-                        document.addEventListener('submit', function(e) {
-                            e.preventDefault();
-                        }, true);
-                    """)
-                except Exception:
-                    pass
-
                 filled_any = False
                 fillable_count = 0
                 filled_elements = []
                 for selector in ('textarea', 'input[type=text]', 'input:not([type])',
-                                  'input[type=search]', 'input[type=email]', 'input[type=url]'):
+                                  'input[type=search]', 'input[type=email]', 'input[type=url]',
+                                  'input[type=number]'):
                     try:
                         elements = page.query_selector_all(selector)
                     except Exception:
@@ -1180,6 +1177,10 @@ class AdvancedXSSScanner:
                         except Exception:
                             continue
 
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
                 page.wait_for_timeout(3500)
 
                 if triggered:
@@ -1198,7 +1199,7 @@ class AdvancedXSSScanner:
         except Exception as e:
             self.log(f"[!] Playwright interactive test failed: {e}", 'error')
             return None
-    
+
     def _test_dom_payload(self, base_url: str, payload: str) -> Optional[Dict]:
         """Test a single DOM XSS payload with Playwright"""
         if not PLAYWRIGHT_AVAILABLE:
@@ -1502,7 +1503,8 @@ class AdvancedXSSScanner:
                 payload = finding.get('payload', '')
                 filled = False
                 for selector in ('textarea', 'input[type=text]', 'input:not([type])',
-                                  'input[type=search]', 'input[type=email]', 'input[type=url]'):
+                  'input[type=search]', 'input[type=email]', 'input[type=url]',
+                  'input[type=number]'):
                     try:
                         elements = page.query_selector_all(selector)
                     except Exception:
@@ -1516,20 +1518,16 @@ class AdvancedXSSScanner:
                             continue
 
                 if filled:
-                    try:
-                        page.evaluate("""
-                            document.addEventListener('submit', function(e) {
-                                e.preventDefault();
-                            }, true);
-                        """)
-                    except Exception:
-                        pass
                     clicked = self._click_submit_like(page)
                     if not clicked:
                         try:
                             page.keyboard.press("Enter")
                         except Exception:
                             pass
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
                     page.wait_for_timeout(3500)
         except Exception:
             pass
